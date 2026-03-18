@@ -1,0 +1,5 @@
+#TABLE users:id:INT,name:VARCHAR
+#ROW:1:'Alice'
+#ROW:1:'Alice'
+#ROW:2:'Bob'
+#ROW:3:'mbb'
