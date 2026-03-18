@@ -34,6 +34,19 @@
 "("                  { return LPAREN; }
 ")"                  { return RPAREN; }
 "*"                  { return STAR; }
+"BEGIN"              { return KW_BEGIN; }
+"COMMIT"             { return KW_COMMIT; }
+"ROLLBACK"           { return KW_ROLLBACK; }
+"COUNT"              { return COUNT; }
+"SUM"                { return SUM; }
+"AVG"                { return AVG; }
+"MIN"                { return MIN; }
+"MAX"                { return MAX; }
+"DROP"               { return DROP; }
+"ORDER"              { return ORDER; }
+"BY"                 { return BY; }
+"ASC"                { return ASC; }
+"DESC"               { return DESC; }
 
 [0-9]+               { yylval.integer = atoi(yytext); return INTEGER; }
 '[^']*'              {
@@ -46,4 +59,5 @@
 }
 
 .                    ;
+
 %%

@@ -34,16 +34,30 @@ struct Condition {  //查询条件
 
 class Table {
 public:
+    Table() = default; 
     Table(const std::vector<ColumnDef>& cols);
-    bool insert(const std::vector<Value>& row);
+    // 拷贝构造函数（深拷贝）
+    Table(const Table& other)
+        : columns(other.columns),
+          rows(other.rows),          // unordered_map 自动深拷贝 value
+          nextRowId(other.nextRowId),
+          columnIndex(other.columnIndex) {}
+    int insertAndGetId(const std::vector<Value>& row);// 插入并返回新行的ID（-1表示失败)
+    bool insert(const std::vector<Value>& row);  
+    std::vector<Value> getRow(int rowId) const;  // 根据ID获取行
     std::vector<std::vector<Value>> select(const Condition* cond) const;
+    bool updateRow(int rowId, const std::vector<Value>& newRow); // 根据ID更新行
     bool update(const Condition* cond, const std::vector<std::pair<std::string, Value>>& assignments);
+    bool removeRow(int rowId); // 根据ID删除行
+    bool matchRow(const std::vector<Value>& row, const Condition* cond) const;
     bool remove(const Condition* cond);
     const std::vector<ColumnDef>& getColumns() const { return columns; }
+    std::vector<std::pair<int, std::vector<Value>>> selectWithIds(const Condition* cond) const;  // 根据条件获取所有匹配的行ID及对应数据
+    bool insertWithId(int rowId, const std::vector<Value>& row); //使用指定ID插入行（用于回滚）
+    const std::unordered_map<std::string, size_t>& getColumnIndex() const { return columnIndex; } //获取列名到索引的映射（用于UPDATE中定位列）
 private:
     std::vector<ColumnDef> columns;
     std::unordered_map<int, std::vector<Value>> rows;
     int nextRowId = 0;
     std::unordered_map<std::string, size_t> columnIndex; 
-    bool matchRow(const std::vector<Value>& row, const Condition* cond) const;
 };

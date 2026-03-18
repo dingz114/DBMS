@@ -11,7 +11,7 @@ bool Value::operator==(const Value& other) const {
 
 bool Value::operator<(const Value& other) const {
     if (type != other.type) {
-        // 简单规定：INT 永远小于 STRING（仅用于避免未定义行为）
+        // INT 永远小于 STRING（仅用于避免未定义行为）
         return type == INT && other.type == STRING;
     }
     if (type == INT) return intVal < other.intVal;
@@ -132,4 +132,57 @@ bool Table::matchRow(const std::vector<Value>& row, const Condition* cond) const
         case Op::GE: return !(rowVal < condVal);
         default: return false;
     }
+}
+
+int Table::insertAndGetId(const std::vector<Value>& row) {
+    if (row.size() != columns.size()) {
+        std::cerr << "ERROR: Column count mismatch." << std::endl;
+        return -1;
+    }
+    for (size_t i = 0; i < row.size(); ++i) {
+        DataType expected = columns[i].type;
+        if ((expected == DataType::INT && row[i].type != Value::INT) ||
+            (expected == DataType::VARCHAR && row[i].type != Value::STRING)) {
+            std::cerr << "ERROR: Type mismatch for column '" << columns[i].name << "'" << std::endl;
+            return -1;
+        }
+    }
+    int id = nextRowId++;
+    rows[id] = row;
+    return id;
+}
+
+std::vector<Value> Table::getRow(int rowId) const {
+    auto it = rows.find(rowId);
+    if (it != rows.end()) return it->second;
+    return {};
+}
+
+bool Table::updateRow(int rowId, const std::vector<Value>& newRow) {
+    auto it = rows.find(rowId);
+    if (it == rows.end()) return false;
+    it->second = newRow;
+    return true;
+}
+
+bool Table::removeRow(int rowId) {
+    auto count = rows.erase(rowId);
+    if (count == 0) {
+        std::cerr << "Debug: removeRow failed, rowId=" << rowId << " not found." << std::endl;
+    }
+    return count > 0;
+}
+
+std::vector<std::pair<int, std::vector<Value>>> Table::selectWithIds(const Condition* cond) const {
+    std::vector<std::pair<int, std::vector<Value>>> result;
+    for (const auto& [id, row] : rows) {
+        if (matchRow(row, cond)) result.push_back({id, row});
+    }
+    return result;
+}
+
+bool Table::insertWithId(int rowId, const std::vector<Value>& row) {
+    if (rows.count(rowId) > 0) return false;
+    rows[rowId] = row;
+    return true;
 }

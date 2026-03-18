@@ -3,6 +3,11 @@
     #include <vector>
     #include <utility>
     #include "storage.h"
+    #include "dbms.h"
+    struct AggFunction {
+        std::string name;
+        std::string arg;           // 列名或 "*"
+    };
 }
 
 %union {
@@ -16,6 +21,11 @@
     std::vector<std::pair<std::string, Value>>* set_list;
     std::pair<std::string, Value>* set_item;
     std::vector<std::string*>* id_list;
+    struct ProjectionItem* proj_item;   // 自定义投影项结构
+    std::vector<ProjectionItem*>* proj_list;
+    struct AggFunction* agg_func;        // 聚合函数结构
+    std::vector<std::pair<std::string, bool>>* order_list;   // 排序项列表，bool为true表示ASC
+    std::pair<std::string, bool>* order_item;
 }
 
 %{
@@ -29,10 +39,14 @@ void yyerror(const char *s);
 extern DBMS dbms;
 %}
 
-%token CREATE TABLE INSERT INTO VALUES SELECT FROM WHERE UPDATE SET DELETE
+/* 终结符声明 */
+%token CREATE TABLE INSERT INTO VALUES SELECT FROM WHERE UPDATE SET DELETE DROP
 %token INT_TYPE VARCHAR_TYPE AND OR
 %token EQ NE LT GT LE GE
 %token COMMA SEMICOLON LPAREN RPAREN STAR
+%token KW_BEGIN KW_COMMIT KW_ROLLBACK  
+%token COUNT SUM AVG MIN MAX 
+%token ORDER BY ASC DESC
 
 %token <integer> INTEGER
 %token <string> IDENTIFIER STRING
@@ -45,7 +59,12 @@ extern DBMS dbms;
 %type <cond> condition where_opt
 %type <set_list> set_list
 %type <set_item> set_item
-%type <id_list> column_list
+%type <proj_list> select_list
+%type <proj_item> select_item
+%type <agg_func> agg_func
+%type <order_list> order_by_opt order_by_clause
+%type <order_item> order_by_item
+
 
 %start program
 
@@ -60,10 +79,20 @@ statement_list:
 
 statement:
       create_stmt SEMICOLON
+    | drop_stmt SEMICOLON 
     | insert_stmt SEMICOLON
     | select_stmt SEMICOLON
     | update_stmt SEMICOLON
     | delete_stmt SEMICOLON
+    | KW_BEGIN SEMICOLON {
+          dbms.begin();
+      }
+    | KW_COMMIT SEMICOLON {
+          dbms.commit();
+      }
+    | KW_ROLLBACK SEMICOLON {
+          dbms.rollback();
+      }
     ;
 
 create_stmt:
@@ -74,6 +103,13 @@ create_stmt:
           delete $3;
           for (auto col : *$5) delete col;
           delete $5;
+      }
+    ;
+
+drop_stmt:
+      DROP TABLE table_name {
+          dbms.dropTable(*$3);
+          delete $3;
       }
     ;
 
@@ -132,28 +168,123 @@ value:
     ;
 
 select_stmt:
-      SELECT select_list FROM table_name where_opt {
-          dbms.selectFrom(*$4, $5);
+      SELECT select_list FROM table_name where_opt order_by_opt {
+          dbms.selectFrom(*$4, *$2, $5, $6);
           delete $4;
+          for (auto item : *$2) delete item;
+          delete $2;
           delete $5;
+          if ($6) {
+              for (auto& p : *$6) ; 
+              delete $6;
+          }
       }
     ;
 
-select_list:
-      STAR
-    | column_list {
+order_by_opt:
+      /* empty */ { $$ = nullptr; }
+    | ORDER BY order_by_clause { $$ = $3; }
+    ;
+
+order_by_clause:
+      order_by_item {
+          $$ = new std::vector<std::pair<std::string, bool>>();
+          $$->push_back(*$1);
+          delete $1;
+      }
+    | order_by_clause COMMA order_by_item {
+          $1->push_back(*$3);
+          delete $3;
+          $$ = $1;
+      }
+    ;
+
+order_by_item:
+      column_name {
+          $$ = new std::pair<std::string, bool>(*$1, true); // 默认ASC
+          delete $1;
+      }
+    | column_name ASC {
+          $$ = new std::pair<std::string, bool>(*$1, true);
+          delete $1;
+      }
+    | column_name DESC {
+          $$ = new std::pair<std::string, bool>(*$1, false);
           delete $1;
       }
     ;
 
-column_list:
-      column_name {
-          $$ = new std::vector<std::string*>();
+select_list:
+      STAR {
+          $$ = new std::vector<ProjectionItem*>();
+          ProjectionItem* item = new ProjectionItem;
+          item->isAgg = false;
+          item->star = true;
+          $$->push_back(item);
+      }
+    | select_item {
+          $$ = new std::vector<ProjectionItem*>();
           $$->push_back($1);
       }
-    | column_list COMMA column_name {
+    | select_list COMMA select_item {
           $1->push_back($3);
           $$ = $1;
+      }
+    ;
+  
+select_item:
+      column_name {
+          $$ = new ProjectionItem;
+          $$->isAgg = false;
+          $$->colName = *$1;
+          $$->star = false;
+          delete $1;
+      }
+    | agg_func {
+          $$ = new ProjectionItem;
+          $$->isAgg = true;
+          $$->funcName = $1->name;
+          $$->colName = $1->arg;
+          $$->star = ($1->arg == "*");
+          delete $1;
+      }
+    ;
+
+agg_func:
+      COUNT LPAREN STAR RPAREN {
+          $$ = new AggFunction;
+          $$->name = "COUNT";
+          $$->arg = "*";
+      }
+    | COUNT LPAREN column_name RPAREN {
+          $$ = new AggFunction;
+          $$->name = "COUNT";
+          $$->arg = *$3;
+          delete $3;
+      }
+    | SUM LPAREN column_name RPAREN {
+          $$ = new AggFunction;
+          $$->name = "SUM";
+          $$->arg = *$3;
+          delete $3;
+      }
+    | AVG LPAREN column_name RPAREN {
+          $$ = new AggFunction;
+          $$->name = "AVG";
+          $$->arg = *$3;
+          delete $3;
+      }
+    | MIN LPAREN column_name RPAREN {
+          $$ = new AggFunction;
+          $$->name = "MIN";
+          $$->arg = *$3;
+          delete $3;
+      }
+    | MAX LPAREN column_name RPAREN {
+          $$ = new AggFunction;
+          $$->name = "MAX";
+          $$->arg = *$3;
+          delete $3;
       }
     ;
 
