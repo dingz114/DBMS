@@ -122,4 +122,4 @@ private:
     void appendRedoLog(const RedoLogRecord& rec);   // 写入单条日志（实际在 commit 中批量写入）
     void recoverFromLog();                           // 恢复函数
 };
-
+extern DBMS dbms;

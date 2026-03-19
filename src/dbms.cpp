@@ -7,7 +7,7 @@
 #include <limits>
 #include<algorithm>
 
-extern DBMS dbms;
+DBMS dbms;
 
 thread_local std::unique_ptr<Transaction> DBMS::currentTxn = nullptr;
 
@@ -474,6 +474,31 @@ void DBMS::selectFrom(const std::string& tableName,
             break;
         }
     }
+     // ---------- 排序：非聚合查询时对原始行排序 ----------
+    if (orderBy && !orderBy->empty() && !hasAgg) {
+        std::vector<std::pair<int, bool>> sortCols;
+        for (const auto& item : *orderBy) {
+            auto it = colIndex.find(item.first);
+            if (it == colIndex.end()) {
+                std::cerr << "Error: ORDER BY column '" << item.first << "' does not exist." << std::endl;
+                if (!inTxn) lockMgr.unlockShared(tableName);
+                return;
+            }
+            sortCols.emplace_back(it->second, item.second);
+        }
+
+        std::sort(rows.begin(), rows.end(),
+            [&sortCols](const std::vector<Value>& a, const std::vector<Value>& b) {
+                for (const auto& sc : sortCols) {
+                    int col = sc.first;
+                    bool asc = sc.second;
+                    if (a[col] == b[col]) continue;
+                    if (asc) return a[col] < b[col];
+                    else return b[col] < a[col];
+                }
+                return false;
+            });
+    }
 
     std::vector<std::vector<Value>> resultRows;
 
@@ -561,39 +586,6 @@ void DBMS::selectFrom(const std::string& tableName,
             }
             resultRows.push_back(resultRow);
         }
-    }
-
-    // 排序（如果指定了 ORDER BY）
-    if (orderBy && !orderBy->empty() && resultRows.size() > 1) {
-        std::vector<std::pair<int, bool>> sortCols;
-        for (const auto& item : *orderBy) {
-            int idx = -1;
-            for (size_t i = 0; i < proj.size(); ++i) {
-                if (!proj[i]->isAgg && proj[i]->colName == item.first) {
-                    idx = i;
-                    break;
-                }
-            }
-            if (idx == -1) {
-                std::cerr << "Error: ORDER BY column '" << item.first
-                          << "' not found in SELECT list or is an aggregate." << std::endl;
-                if (!inTxn)lockMgr.unlockShared(tableName);
-                return;
-            }
-            sortCols.emplace_back(idx, item.second);
-        }
-
-        std::sort(resultRows.begin(), resultRows.end(),
-            [&sortCols](const std::vector<Value>& a, const std::vector<Value>& b) {
-                for (const auto& sc : sortCols) {
-                    int col = sc.first;
-                    bool asc = sc.second;
-                    if (a[col] == b[col]) continue;
-                    if (asc) return a[col] < b[col];
-                    else return b[col] < a[col];
-                }
-                return false;
-            });
     }
 
     // 输出结果
