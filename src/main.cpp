@@ -4,6 +4,7 @@
 #include "dbms.h"
 
 extern int yyparse();
+DBMS dbms;
 
 int main() {
     std::string line;

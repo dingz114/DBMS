@@ -7,7 +7,7 @@
 #include <limits>
 #include<algorithm>
 
-DBMS dbms;
+extern DBMS dbms;
 
 thread_local std::unique_ptr<Transaction> DBMS::currentTxn = nullptr;
 
@@ -24,11 +24,11 @@ struct AggResult {
 
 DBMS::DBMS() {
     loadSnapshot();
+    recoverFromLog();   // 在加载快照后重放日志
 }
 
 void DBMS::lockTableInTxn(const std::string& tableName, bool exclusive) {
     if (!currentTxn) return; // 不应调用
-
     // 查找当前事务是否已持有该表的锁
     auto it = std::find_if(currentTxn->locksHeld.begin(), currentTxn->locksHeld.end(),
         [&](const auto& lock){ return lock.first == tableName; });
@@ -64,6 +64,14 @@ void DBMS::begin() {
     currentTxn = std::make_unique<Transaction>();
     currentTxn->txnId = nextTxnId++;
     currentTxn->status = TxnStatus::ACTIVE;
+    // 记录 BEGIN 日志
+    // RedoLogRecord beginRec{RedoLogType::TXN_BEGIN, currentTxn->txnId, "", 0, {}};
+    {
+        std::lock_guard<std::mutex> lock(logMutex);
+        std::ofstream log(LOG_FILE, std::ios::app);
+        log << currentTxn->txnId << " " << static_cast<int>(RedoLogType::TXN_BEGIN) << "\n";
+        log.flush();
+    }
     std::cout << "Transaction " << currentTxn->txnId << " started." << std::endl;
 }
 
@@ -72,9 +80,30 @@ void DBMS::commit() {
         std::cerr << "ERROR: No active transaction." << std::endl;
         return;
     }
-    // 释放所有锁
+    // 将所有 REDO 日志写入文件
+    {
+        std::lock_guard<std::mutex> lock(logMutex);
+        std::ofstream log(LOG_FILE, std::ios::app);
+        for (const auto& rec : currentTxn->redoLog) {
+            // 写入操作记录
+            log << rec.txnId << " " << static_cast<int>(rec.type) << " "
+                << rec.tableName << " " << rec.rowId;
+            // 写入值列表
+            for (const auto& val : rec.newRow) {
+                if (val.type == Value::INT)
+                    log << " " << val.intVal;
+                else
+                    log << " '" << val.strVal << "'";
+            }
+            log << "\n";
+        }
+        // 写入 COMMIT 记录
+        log << currentTxn->txnId << " " << static_cast<int>(RedoLogType::TXN_COMMIT) << "\n";
+        log.flush(); // 刷盘保证持久性
+    }
+    // 释放锁
     for (const auto& lock : currentTxn->locksHeld) {
-        if (lock.second) // 排他锁
+        if (lock.second)
             lockMgr.unlockExclusive(lock.first);
         else
             lockMgr.unlockShared(lock.first);
@@ -82,6 +111,7 @@ void DBMS::commit() {
     currentTxn->status = TxnStatus::COMMITTED;
     currentTxn.reset();
     std::cout << "Transaction committed." << std::endl;
+    saveSnapshot();   // 新增：提交后立即保存快照
 }
 
 void DBMS::rollback() {
@@ -104,6 +134,13 @@ void DBMS::rollback() {
                 table->updateRow(it->rowId, it->oldRow);
                 break;
         }
+    }
+    // 写入 ABORT 日志
+    {
+        std::lock_guard<std::mutex> lock(logMutex);
+        std::ofstream log(LOG_FILE, std::ios::app);
+        log << currentTxn->txnId << " " << static_cast<int>(RedoLogType::TXN_ABORT) << "\n";
+        log.flush();
     }
     // 释放所有锁
     for (const auto& lock : currentTxn->locksHeld) {
@@ -129,14 +166,14 @@ Table* DBMS::getTable(const std::string& name) {
 void DBMS::createTable(const std::string& name, const std::vector<ColumnDef>& columns) {
     {
         std::unique_lock<std::shared_mutex> lock(tablesMutex);
-    // 检查表是否已存在
-    if (tables.find(name) != tables.end()) {
-        std::cerr << "ERROR: Table '" << name << "' already exists." << std::endl;
-        return;
-    }
-    // 创建新表并加入管理容器
-    tables.emplace(name, Table(columns));
-    std::cout << "Table '" << name << "' created successfully." << std::endl;
+        // 检查表是否已存在
+        if (tables.find(name) != tables.end()) {
+            std::cerr << "ERROR: Table '" << name << "' already exists." << std::endl;
+            return;
+        }
+        // 创建新表并加入管理容器
+        tables.emplace(name, Table(columns));
+        std::cout << "Table '" << name << "' created successfully." << std::endl;
     }
     saveSnapshot();   // 表结构改变，保存
 }
@@ -157,19 +194,21 @@ void DBMS::dropTable(const std::string& name) {
 
 void DBMS::insertInto(const std::string& tableName, const std::vector<Value>& values) {
     if (currentTxn) {
-        lockTableInTxn(tableName, true); // 需要排他锁
-
+        lockTableInTxn(tableName, true); // 排他锁
         Table* table = getTable(tableName);
         if (!table) {
             lockMgr.unlockExclusive(tableName);
-            currentTxn->locksHeld.pop_back();
+            if (!currentTxn->locksHeld.empty())
+                currentTxn->locksHeld.pop_back();
             return;
         }
-
         int newId = table->insertAndGetId(values);
         if (newId >= 0) {
-            LogRecord rec{LogType::INSERT, tableName, newId, {}, values};
-            currentTxn->undoLog.push_back(rec);
+            // UNDO 日志（用于回滚）
+            currentTxn->undoLog.push_back({LogType::INSERT, tableName, newId, {}, values});
+            // REDO 日志（用于持久化）
+            RedoLogRecord redo{RedoLogType::INSERT, currentTxn->txnId, tableName, newId, values};
+            currentTxn->redoLog.push_back(redo);
             std::cout << "Inserted (txn) 1 row into '" << tableName << "'." << std::endl;
         } else {
             std::cerr << "Insert failed." << std::endl;
@@ -193,20 +232,18 @@ void DBMS::update(const std::string& tableName,
                   const Condition* cond) {
     if (currentTxn) {
         lockTableInTxn(tableName, true);
-
         Table* table = getTable(tableName);
         if (!table) {
             lockMgr.unlockExclusive(tableName);
-            currentTxn->locksHeld.pop_back();
+            if (!currentTxn->locksHeld.empty())
+                currentTxn->locksHeld.pop_back();
             return;
         }
-
         auto rows = table->selectWithIds(cond);
         if (rows.empty()) {
             std::cout << "No rows matched." << std::endl;
             return;
         }
-
         for (const auto& [id, oldRow] : rows) {
             std::vector<Value> newRow = oldRow;
             for (const auto& [colName, newVal] : assignments) {
@@ -217,9 +254,11 @@ void DBMS::update(const std::string& tableName,
                 }
                 newRow[it->second] = newVal;
             }
-
-            LogRecord rec{LogType::UPDATE, tableName, id, oldRow, newRow};
-            currentTxn->undoLog.push_back(rec);
+            // UNDO
+            currentTxn->undoLog.push_back({LogType::UPDATE, tableName, id, oldRow, newRow});
+            // REDO
+            RedoLogRecord redo{RedoLogType::UPDATE, currentTxn->txnId, tableName, id, newRow};
+            currentTxn->redoLog.push_back(redo);
             table->updateRow(id, newRow);
         }
         std::cout << "Updated (txn) " << rows.size() << " row(s)." << std::endl;
@@ -239,23 +278,24 @@ void DBMS::update(const std::string& tableName,
 void DBMS::deleteFrom(const std::string& tableName, const Condition* cond) {
     if (currentTxn) {
         lockTableInTxn(tableName, true);
-
         Table* table = getTable(tableName);
         if (!table) {
             lockMgr.unlockExclusive(tableName);
-            currentTxn->locksHeld.pop_back();
+            if (!currentTxn->locksHeld.empty())
+                currentTxn->locksHeld.pop_back();
             return;
         }
-
         auto rows = table->selectWithIds(cond);
         if (rows.empty()) {
             std::cout << "No rows matched." << std::endl;
             return;
         }
-
         for (const auto& [id, oldRow] : rows) {
-            LogRecord rec{LogType::DELETE, tableName, id, oldRow, {}};
-            currentTxn->undoLog.push_back(rec);
+            // UNDO
+            currentTxn->undoLog.push_back({LogType::DELETE, tableName, id, oldRow, {}});
+            // REDO (DELETE 只需记录表名和行ID)
+            RedoLogRecord redo{RedoLogType::DELETE, currentTxn->txnId, tableName, id, {}};
+            currentTxn->redoLog.push_back(redo);
             table->removeRow(id);
         }
         std::cout << "Deleted (txn) " << rows.size() << " row(s)." << std::endl;
@@ -300,78 +340,80 @@ void DBMS::saveSnapshot() {
         std::cerr << "ERROR: Cannot open snapshot file for writing." << std::endl;
         return;
     }
-
     // 保护 tables 的读取
-    std::shared_lock<std::shared_mutex> lock(tablesMutex);
-    for (const auto& [name, table] : tables) {
-        ofs << "#TABLE " << name;
-        const auto& cols = table.getColumns();
-        for (size_t i = 0; i < cols.size(); ++i) {
-            ofs << (i == 0 ? ":" : ",") << cols[i].name << ":"
-                << (cols[i].type == DataType::INT ? "INT" : "VARCHAR");
-        }
-        ofs << "\n";
-        auto rows = table.select(nullptr);
-        for (const auto& row : rows) {
-            ofs << "#ROW";
-            for (const auto& val : row) {
-                ofs << ":" << valueToString(val);
+    {
+        std::shared_lock<std::shared_mutex> lock(tablesMutex);
+        for (const auto& [name, table] : tables) {
+            ofs << "#TABLE " << name;
+            const auto& cols = table.getColumns();
+            for (size_t i = 0; i < cols.size(); ++i) {
+                ofs << (i == 0 ? ":" : ",") << cols[i].name << ":"
+                    << (cols[i].type == DataType::INT ? "INT" : "VARCHAR");
             }
             ofs << "\n";
+            auto rows = table.select(nullptr);
+            for (const auto& row : rows) {
+                ofs << "#ROW";
+                for (const auto& val : row) ofs << ":" << valueToString(val);
+                ofs << "\n";
+            }
         }
     }
     ofs.close();
-    lock.unlock();
-
     if (rename(tmpFile.c_str(), SNAPSHOT_FILE) != 0) {
         std::cerr << "ERROR: Failed to commit snapshot." << std::endl;
+    }
+    // 保存成功后，清空日志文件
+    {
+        std::lock_guard<std::mutex> lock(logMutex);
+        std::ofstream ofs(LOG_FILE, std::ios::trunc);
+        ofs.close();
     }
 }
 
 void DBMS::loadSnapshot() {
     std::ifstream ifs(SNAPSHOT_FILE);
     if (!ifs) return;
-
     std::string line;
     std::string currentTable;
     std::vector<ColumnDef> currentColumns;
-
-    // 需要排他锁修改 tables
-    std::unique_lock<std::shared_mutex> lock(tablesMutex);
-    while (std::getline(ifs, line)) {
-        if (line.empty()) continue;
-        if (line[0] == '#') {
-            if (line.substr(0, 7) == "#TABLE ") {
-                size_t pos = 7;
-                size_t colon = line.find(':', pos);
-                currentTable = line.substr(pos, colon - pos);
-                std::string colPart = line.substr(colon + 1);
-                std::istringstream colss(colPart);
-                std::string colDef;
-                currentColumns.clear();
-                while (std::getline(colss, colDef, ',')) {
-                    size_t nameColon = colDef.find(':');
-                    std::string colName = colDef.substr(0, nameColon);
-                    std::string typeStr = colDef.substr(nameColon + 1);
-                    DataType type = (typeStr == "INT") ? DataType::INT : DataType::VARCHAR;
-                    currentColumns.emplace_back(colName, type);
+    {
+        std::unique_lock<std::shared_mutex> lock(tablesMutex);
+        while (std::getline(ifs, line)) {
+            if (line.empty()) continue;
+            if (line[0] == '#') {
+                if (line.substr(0, 7) == "#TABLE ") {
+                    size_t pos = 7;
+                    size_t colon = line.find(':', pos);
+                    currentTable = line.substr(pos, colon - pos);
+                    std::string colPart = line.substr(colon + 1);
+                    std::istringstream colss(colPart);
+                    std::string colDef;
+                    currentColumns.clear();
+                    while (std::getline(colss, colDef, ',')) {
+                        size_t nameColon = colDef.find(':');
+                        std::string colName = colDef.substr(0, nameColon);
+                        std::string typeStr = colDef.substr(nameColon + 1);
+                        DataType type = (typeStr == "INT") ? DataType::INT : DataType::VARCHAR;
+                        currentColumns.emplace_back(colName, type);
+                    }
+                    tables.emplace(currentTable, Table(currentColumns));
+                } else if (line.substr(0, 5) == "#ROW:" && !currentTable.empty()) {
+                    auto it = tables.find(currentTable);
+                    if (it == tables.end()) continue;
+                    std::string data = line.substr(5);
+                    std::istringstream dss(data);
+                    std::string token;
+                    std::vector<Value> row;
+                    const auto& cols = it->second.getColumns();
+                    size_t colIdx = 0;
+                    while (std::getline(dss, token, ':')) {
+                        if (colIdx >= cols.size()) break;
+                        row.push_back(stringToValue(token, cols[colIdx].type));
+                        ++colIdx;
+                    }
+                    it->second.insert(row);
                 }
-                tables.emplace(currentTable, Table(currentColumns));
-            } else if (line.substr(0, 5) == "#ROW:" && !currentTable.empty()) {
-                auto it = tables.find(currentTable);
-                if (it == tables.end()) continue;
-                std::string data = line.substr(5);
-                std::istringstream dss(data);
-                std::string token;
-                std::vector<Value> row;
-                const auto& cols = it->second.getColumns();
-                size_t colIdx = 0;
-                while (std::getline(dss, token, ':')) {
-                    if (colIdx >= cols.size()) break;
-                    row.push_back(stringToValue(token, cols[colIdx].type));
-                    ++colIdx;
-                }
-                it->second.insert(row);
             }
         }
     }
@@ -389,29 +431,37 @@ void DBMS::selectFrom(const std::string& tableName,
     } else {
         lockMgr.lockShared(tableName);
     }
-
     Table* table = getTable(tableName);
     if (!table) {
-        if (!inTxn) lockMgr.unlockShared(tableName);
+        if (inTxn) {
+            lockMgr.unlockShared(tableName);
+            if (!currentTxn->locksHeld.empty())
+                currentTxn->locksHeld.pop_back();
+        } else {
+            lockMgr.unlockShared(tableName);
+        }
         return;
     }
-
     auto rows = table->select(cond);
     if (rows.empty()) {
         std::cout << "No rows found." << std::endl;
         lockMgr.unlockShared(tableName);
         return;
     }
-
     const auto& cols = table->getColumns();
     const auto& colIndex = table->getColumnIndex();
-
     // 检查投影列合法性
     for (auto item : proj) {
         if (!item->star && !item->isAgg) {
             if (colIndex.find(item->colName) == colIndex.end()) {
                 std::cerr << "Error: Unknown column '" << item->colName << "'." << std::endl;
-                lockMgr.unlockShared(tableName);
+                if (inTxn) {
+                    lockMgr.unlockShared(tableName);
+                    if (!currentTxn->locksHeld.empty())
+                        currentTxn->locksHeld.pop_back();
+                } else {
+                    lockMgr.unlockShared(tableName);
+                }
                 return;
             }
         }
@@ -527,7 +577,7 @@ void DBMS::selectFrom(const std::string& tableName,
             if (idx == -1) {
                 std::cerr << "Error: ORDER BY column '" << item.first
                           << "' not found in SELECT list or is an aggregate." << std::endl;
-                lockMgr.unlockShared(tableName);
+                if (!inTxn)lockMgr.unlockShared(tableName);
                 return;
             }
             sortCols.emplace_back(idx, item.second);
@@ -587,4 +637,72 @@ void DBMS::selectFrom(const std::string& tableName,
         lockMgr.unlockShared(tableName);
     }
     // 事务中锁会在 commit/rollback 时释放
+}
+
+void DBMS::recoverFromLog() {
+    std::ifstream ifs(LOG_FILE);
+    if (!ifs) return;
+
+    std::string line;
+    std::unordered_map<int, std::vector<RedoLogRecord>> txnOps; // 按事务分组
+    int currentTxn = -1;
+
+    while (std::getline(ifs, line)) {
+        std::istringstream iss(line);
+        int txnId;
+        int typeInt;
+        iss >> txnId >> typeInt;
+        RedoLogType type = static_cast<RedoLogType>(typeInt);
+
+        if (type == RedoLogType::TXN_BEGIN) {
+            currentTxn = txnId;
+            txnOps[currentTxn] = {};
+        } else if (type == RedoLogType::TXN_COMMIT) {
+            // 重放该事务的所有操作
+            for (const auto& rec : txnOps[txnId]) {
+                Table* table = getTable(rec.tableName);
+                if (!table) continue;
+                switch (rec.type) {
+                    case RedoLogType::INSERT:
+                        table->insertWithId(rec.rowId, rec.newRow);
+                        break;
+                    case RedoLogType::UPDATE:
+                        table->updateRow(rec.rowId, rec.newRow);
+                        break;
+                    case RedoLogType::DELETE:
+                        table->removeRow(rec.rowId);
+                        break;
+                    default:
+                        break;
+                }
+            }
+            txnOps.erase(txnId);
+            currentTxn = -1;
+        } else if (type == RedoLogType::TXN_ABORT) {
+            txnOps.erase(txnId);
+            currentTxn = -1;
+        } else {
+            // 操作记录：解析表名、行ID、值列表
+            std::string tableName;
+            int rowId;
+            iss >> tableName >> rowId;
+            std::vector<Value> newRow;
+            // 解析剩余的值
+            std::string token;
+            while (iss >> token) {
+                if (token.front() == '\'') {
+                    // 字符串值，去掉引号
+                    newRow.emplace_back(token.substr(1, token.size()-2));
+                } else {
+                    // 整数
+                    newRow.emplace_back(std::stoi(token));
+                }
+            }
+            RedoLogRecord rec{type, txnId, tableName, rowId, newRow};
+            txnOps[txnId].push_back(rec);
+        }
+    }
+    // 恢复完成后，清空日志文件（避免下次重复恢复）
+    std::ofstream ofs(LOG_FILE, std::ios::trunc);
+    ofs.close();
 }

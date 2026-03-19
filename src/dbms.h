@@ -8,6 +8,7 @@
 #include <thread>
 #include <atomic>
 #include <list>
+#include <fstream>
 #include "storage.h"
 
 // 锁管理器类，提供表级读写锁
@@ -53,6 +54,7 @@ private:
 
 enum class TxnStatus { ACTIVE, COMMITTED, ABORTED };
 enum class LogType { INSERT, UPDATE, DELETE };
+enum class RedoLogType { TXN_BEGIN, INSERT, UPDATE, DELETE, TXN_COMMIT, TXN_ABORT };
 
 struct LogRecord {
     LogType type;
@@ -62,10 +64,20 @@ struct LogRecord {
     std::vector<Value> newRow;   // 用于 REDO（可选，暂不使用）
 };
 
+struct RedoLogRecord {
+    RedoLogType type;
+    int txnId;
+    std::string tableName;
+    int rowId;
+    std::vector<Value> newRow;   // 用于 INSERT 和 UPDATE
+};
+
+
 struct Transaction {
     int txnId;
     TxnStatus status;
     std::vector<LogRecord> undoLog;                     // 撤销日志
+    std::vector<RedoLogRecord> redoLog; 
     std::vector<std::pair<std::string, bool>> locksHeld; // 持有的表锁，bool=true为排他锁
 };
 
@@ -105,5 +117,9 @@ private:
     static thread_local std::unique_ptr<Transaction> currentTxn;
     std::atomic<int> nextTxnId{1};
     void lockTableInTxn(const std::string& tableName, bool exclusive);
+    static constexpr const char* LOG_FILE = "minidb.log";
+    std::mutex logMutex;
+    void appendRedoLog(const RedoLogRecord& rec);   // 写入单条日志（实际在 commit 中批量写入）
+    void recoverFromLog();                           // 恢复函数
 };
 
