@@ -2,7 +2,7 @@
 
 MiniDB 是一个基于哈希表的轻量级内存数据库，使用 Flex/Bison 解析 SQL，支持多线程并发访问、事务（ACID）、持久化存储和网络服务。
 
-## ✨ 功能特性
+## 功能特性
 
 - **SQL 解析**：支持基本的 DDL/DML 语句
   - `CREATE TABLE` 创建表（支持 INT/VARCHAR 类型）
