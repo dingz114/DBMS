@@ -25,48 +25,29 @@ DBMS::DBMS() {
 }
 
 void DBMS::begin() {
-    if (inTxn) {
-        std::cerr << "ERROR: Already in a transaction." << std::endl;
-        return;
-    }
-    // 深拷贝所有表
-    txnSnapshot = tables;   
-    inTxn = true;
-    std::cout << "Transaction started." << std::endl;
+    
 }
 
 void DBMS::commit() {
-    if (!inTxn) {
-        std::cerr << "ERROR: No active transaction." << std::endl;
-        return;
-    }
-    // 用快照替换原表
-    tables = std::move(txnSnapshot);
-    txnSnapshot.clear();
-    inTxn = false;
-    std::cout << "Transaction committed." << std::endl;
-    saveSnapshot();   // 提交后持久化
+    
 }
 
 void DBMS::rollback() {
-    if (!inTxn) {
-        std::cerr << "ERROR: No active transaction." << std::endl;
-        return;
-    }
-    // 直接丢弃快照
-    txnSnapshot.clear();
-    inTxn = false;
-    std::cout << "Transaction rolled back." << std::endl;
+    
 }
 
 Table* DBMS::getTable(const std::string& name) {
-    auto& map = inTxn ? txnSnapshot : tables;
-    auto it = map.find(name);
-    if (it == map.end()) return nullptr;
+    std::shared_lock<std::shared_mutex> lock(tablesMutex);
+    auto it = tables.find(name);
+    if (it == tables.end()) {
+        return nullptr;
+    }
     return &it->second;
 }
 
 void DBMS::createTable(const std::string& name, const std::vector<ColumnDef>& columns) {
+    {
+        std::unique_lock<std::shared_mutex> lock(tablesMutex);
     // 检查表是否已存在
     if (tables.find(name) != tables.end()) {
         std::cerr << "ERROR: Table '" << name << "' already exists." << std::endl;
@@ -75,58 +56,82 @@ void DBMS::createTable(const std::string& name, const std::vector<ColumnDef>& co
     // 创建新表并加入管理容器
     tables.emplace(name, Table(columns));
     std::cout << "Table '" << name << "' created successfully." << std::endl;
+    }
     saveSnapshot();   // 表结构改变，保存
 }
 
 void DBMS::dropTable(const std::string& name) {
-    if (inTxn) {
-        std::cerr << "ERROR: Cannot DROP TABLE within a transaction (simplified)." << std::endl;
-        return;
+    {
+        std::unique_lock<std::shared_mutex> lock(tablesMutex);
+        auto it = tables.find(name);
+        if (it == tables.end()) {
+            std::cerr << "ERROR: Table '" << name << "' does not exist." << std::endl;
+            return;
+        }   
+        tables.erase(it);
+        std::cout << "Table '" << name << "' dropped." << std::endl;
     }
-    auto it = tables.find(name);
-    if (it == tables.end()) {
-        std::cerr << "ERROR: Table '" << name << "' does not exist." << std::endl;
-        return;
-    }
-    tables.erase(it);
-    std::cout << "Table '" << name << "' dropped." << std::endl;
-    saveSnapshot();   // 立即持久化
+    saveSnapshot();
 }
 
 void DBMS::insertInto(const std::string& tableName, const std::vector<Value>& values) {
+    // 先加表写锁
+    lockMgr.lockExclusive(tableName);
+
     Table* table = getTable(tableName);
-    if (!table) return;
+    if (!table) {
+        lockMgr.unlockExclusive(tableName);
+        return;
+    }
+
     if (table->insert(values)) {
-        std::cout << "Inserted " << (inTxn ? "(txn) " : "") << "1 row into '" << tableName << "'." << std::endl;
-        if (!inTxn) saveSnapshot();
+        std::cout << "Inserted 1 row into '" << tableName << "'." << std::endl;
     } else {
         std::cerr << "Insert failed." << std::endl;
     }
+
+    lockMgr.unlockExclusive(tableName);
+    saveSnapshot();  // 自动提交模式立即持久化
 }
 
 
 void DBMS::update(const std::string& tableName,
                   const std::vector<std::pair<std::string, Value>>& assignments,
                   const Condition* cond) {
+    lockMgr.lockExclusive(tableName);
+
     Table* table = getTable(tableName);
-    if (!table) return;
+    if (!table) {
+        lockMgr.unlockExclusive(tableName);
+        return;
+    }
+
     if (table->update(cond, assignments)) {
-        std::cout << "Updated " << (inTxn ? "(txn) " : "") << "row(s)." << std::endl;
-        if (!inTxn) saveSnapshot();
+        std::cout << "Updated row(s)." << std::endl;
     } else {
         std::cerr << "Update failed." << std::endl;
     }
+    lockMgr.unlockExclusive(tableName);
+    saveSnapshot();
 }
 
 void DBMS::deleteFrom(const std::string& tableName, const Condition* cond) {
+    lockMgr.lockExclusive(tableName);
+
     Table* table = getTable(tableName);
-    if (!table) return;
+    if (!table) {
+        lockMgr.unlockExclusive(tableName);
+        return;
+    }
+
     if (table->remove(cond)) {
-        std::cout << "Deleted " << (inTxn ? "(txn) " : "") << "row(s)." << std::endl;
-        if (!inTxn) saveSnapshot();
+        std::cout << "Deleted row(s)." << std::endl;
     } else {
         std::cerr << "Delete failed." << std::endl;
     }
+
+    lockMgr.unlockExclusive(tableName);
+    saveSnapshot();
 }
 
 // 将 Value 转换为字符串（用于保存）
@@ -151,7 +156,6 @@ Value stringToValue(const std::string& str, DataType type) {
 }
 
 void DBMS::saveSnapshot() {
-    // 先写入临时文件，成功后 rename
     std::string tmpFile = std::string(SNAPSHOT_FILE) + ".tmp";
     std::ofstream ofs(tmpFile);
     if (!ofs) {
@@ -159,8 +163,9 @@ void DBMS::saveSnapshot() {
         return;
     }
 
+    // 保护 tables 的读取
+    std::shared_lock<std::shared_mutex> lock(tablesMutex);
     for (const auto& [name, table] : tables) {
-        // 写入表定义
         ofs << "#TABLE " << name;
         const auto& cols = table.getColumns();
         for (size_t i = 0; i < cols.size(); ++i) {
@@ -168,9 +173,7 @@ void DBMS::saveSnapshot() {
                 << (cols[i].type == DataType::INT ? "INT" : "VARCHAR");
         }
         ofs << "\n";
-
-        // 写入所有行
-        auto rows = table.select(nullptr);  // 无条件获取所有行
+        auto rows = table.select(nullptr);
         for (const auto& row : rows) {
             ofs << "#ROW";
             for (const auto& val : row) {
@@ -180,8 +183,8 @@ void DBMS::saveSnapshot() {
         }
     }
     ofs.close();
+    lock.unlock();
 
-    // 原子替换
     if (rename(tmpFile.c_str(), SNAPSHOT_FILE) != 0) {
         std::cerr << "ERROR: Failed to commit snapshot." << std::endl;
     }
@@ -194,13 +197,13 @@ void DBMS::loadSnapshot() {
     std::string line;
     std::string currentTable;
     std::vector<ColumnDef> currentColumns;
-    bool inTable = false;
 
+    // 需要排他锁修改 tables
+    std::unique_lock<std::shared_mutex> lock(tablesMutex);
     while (std::getline(ifs, line)) {
         if (line.empty()) continue;
         if (line[0] == '#') {
             if (line.substr(0, 7) == "#TABLE ") {
-                // 解析表定义
                 size_t pos = 7;
                 size_t colon = line.find(':', pos);
                 currentTable = line.substr(pos, colon - pos);
@@ -216,14 +219,9 @@ void DBMS::loadSnapshot() {
                     currentColumns.emplace_back(colName, type);
                 }
                 tables.emplace(currentTable, Table(currentColumns));
-                inTable = true;
-            } else if (line.substr(0, 5) == "#ROW:" && inTable) {
-                // 使用 find 获取表，避免 operator[] 的默认构造
+            } else if (line.substr(0, 5) == "#ROW:" && !currentTable.empty()) {
                 auto it = tables.find(currentTable);
-                if (it == tables.end()) {
-                    std::cerr << "Snapshot error: row before table definition." << std::endl;
-                    continue;
-                }
+                if (it == tables.end()) continue;
                 std::string data = line.substr(5);
                 std::istringstream dss(data);
                 std::string token;
@@ -247,29 +245,36 @@ void DBMS::selectFrom(const std::string& tableName,
                       const Condition* cond,
                       const std::vector<std::pair<std::string, bool>>* orderBy)
 {
+    // 加表读锁（共享锁）
+    lockMgr.lockShared(tableName);
+
     Table* table = getTable(tableName);
-    if (!table) return;
+    if (!table) {
+        lockMgr.unlockShared(tableName);
+        return;
+    }
 
     auto rows = table->select(cond);
     if (rows.empty()) {
         std::cout << "No rows found." << std::endl;
+        lockMgr.unlockShared(tableName);
         return;
     }
 
     const auto& cols = table->getColumns();
-    const auto& colIndex = table->getColumnIndex(); 
+    const auto& colIndex = table->getColumnIndex();
 
     // 检查投影列合法性
     for (auto item : proj) {
         if (!item->star && !item->isAgg) {
             if (colIndex.find(item->colName) == colIndex.end()) {
                 std::cerr << "Error: Unknown column '" << item->colName << "'." << std::endl;
+                lockMgr.unlockShared(tableName);
                 return;
             }
         }
     }
 
-    // 判断是否有聚合函数
     bool hasAgg = false;
     for (auto item : proj) {
         if (item->isAgg) {
@@ -278,18 +283,18 @@ void DBMS::selectFrom(const std::string& tableName,
         }
     }
 
-    std::vector<std::vector<Value>> resultRows; // 最终结果行
+    std::vector<std::vector<Value>> resultRows;
 
     if (hasAgg) {
-        // ---------- 聚合查询（无GROUP BY，整表一组）----------
+        // 聚合查询（无GROUP BY）
         std::vector<Value> resultRow;
         for (auto item : proj) {
             if (!item->isAgg) {
                 std::cerr << "Error: Mixed column and aggregation without GROUP BY." << std::endl;
+                lockMgr.unlockShared(tableName);
                 return;
             }
             if (item->star) {
-                // COUNT(*)
                 resultRow.emplace_back(static_cast<int>(rows.size()));
                 continue;
             }
@@ -308,7 +313,7 @@ void DBMS::selectFrom(const std::string& tableName,
                     if (row[colIdx].type == Value::INT)
                         avg += row[colIdx].intVal;
                 avg /= rows.size();
-                resultRow.emplace_back(static_cast<int>(avg)); // 简化，丢失精度
+                resultRow.emplace_back(static_cast<int>(avg));
             } else if (item->funcName == "MIN") {
                 int minInt = std::numeric_limits<int>::max();
                 std::string minStr;
@@ -341,10 +346,9 @@ void DBMS::selectFrom(const std::string& tableName,
         }
         resultRows.push_back(resultRow);
     } else {
-        // ---------- 普通投影（无聚合）----------
+        // 普通投影
         std::vector<size_t> colIndices;
         if (proj.size() == 1 && proj[0]->star) {
-            // 选择所有列
             for (size_t i = 0; i < cols.size(); ++i) colIndices.push_back(i);
         } else {
             for (auto item : proj) {
@@ -352,6 +356,7 @@ void DBMS::selectFrom(const std::string& tableName,
                 auto it = colIndex.find(item->colName);
                 if (it == colIndex.end()) {
                     std::cerr << "Error: Unknown column '" << item->colName << "'." << std::endl;
+                    lockMgr.unlockShared(tableName);
                     return;
                 }
                 colIndices.push_back(it->second);
@@ -366,13 +371,11 @@ void DBMS::selectFrom(const std::string& tableName,
         }
     }
 
-    // ---------- 排序 ----------
+    // 排序（如果指定了 ORDER BY）
     if (orderBy && !orderBy->empty() && resultRows.size() > 1) {
-        // 构建排序列在结果行中的索引
         std::vector<std::pair<int, bool>> sortCols;
         for (const auto& item : *orderBy) {
             int idx = -1;
-            // 排序列必须在SELECT列表中且为非聚合列
             for (size_t i = 0; i < proj.size(); ++i) {
                 if (!proj[i]->isAgg && proj[i]->colName == item.first) {
                     idx = i;
@@ -382,9 +385,10 @@ void DBMS::selectFrom(const std::string& tableName,
             if (idx == -1) {
                 std::cerr << "Error: ORDER BY column '" << item.first
                           << "' not found in SELECT list or is an aggregate." << std::endl;
+                lockMgr.unlockShared(tableName);
                 return;
             }
-            sortCols.emplace_back(idx, item.second); // true表示ASC
+            sortCols.emplace_back(idx, item.second);
         }
 
         std::sort(resultRows.begin(), resultRows.end(),
@@ -396,23 +400,19 @@ void DBMS::selectFrom(const std::string& tableName,
                     if (asc) return a[col] < b[col];
                     else return b[col] < a[col];
                 }
-                return false; // 相等
+                return false;
             });
     }
 
-    // ---------- 输出结果 ----------
-    // 打印列名
+    // 输出结果
     for (size_t i = 0; i < proj.size(); ++i) {
         if (i > 0) std::cout << " | ";
         if (proj[i]->star) {
-            // 若投影为 *，已展开为所有列，此处需输出所有列名
             if (proj.size() == 1 && proj[0]->star) {
                 for (size_t j = 0; j < cols.size(); ++j) {
                     if (j > 0) std::cout << " | ";
                     std::cout << cols[j].name;
                 }
-                // 跳过后续分隔符循环
-                i = proj.size(); // 退出循环
                 break;
             } else {
                 std::cout << "*";
@@ -424,13 +424,11 @@ void DBMS::selectFrom(const std::string& tableName,
         }
     }
     std::cout << std::endl;
-    // 打印分隔线
     for (size_t i = 0; i < proj.size(); ++i) {
         if (i > 0) std::cout << "-+-";
         std::cout << "---";
     }
     std::cout << std::endl;
-    // 打印行
     for (const auto& row : resultRows) {
         for (size_t i = 0; i < row.size(); ++i) {
             if (i > 0) std::cout << " | ";
@@ -442,4 +440,6 @@ void DBMS::selectFrom(const std::string& tableName,
         std::cout << std::endl;
     }
     std::cout << resultRows.size() << " row(s) returned." << std::endl;
+
+    lockMgr.unlockShared(tableName);
 }
