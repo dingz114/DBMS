@@ -5,6 +5,9 @@
 #include <utility>
 #include <shared_mutex>
 #include <mutex>
+#include <thread>
+#include <atomic>
+#include <list>
 #include "storage.h"
 
 // 锁管理器类，提供表级读写锁
@@ -47,6 +50,26 @@ private:
     std::mutex mapMutex;   // 保护 locks 的并发访问
 };
 
+
+enum class TxnStatus { ACTIVE, COMMITTED, ABORTED };
+enum class LogType { INSERT, UPDATE, DELETE };
+
+struct LogRecord {
+    LogType type;
+    std::string tableName;
+    int rowId;                  // 受影响的行ID
+    std::vector<Value> oldRow;   // 用于 UNDO
+    std::vector<Value> newRow;   // 用于 REDO（可选，暂不使用）
+};
+
+struct Transaction {
+    int txnId;
+    TxnStatus status;
+    std::vector<LogRecord> undoLog;                     // 撤销日志
+    std::vector<std::pair<std::string, bool>> locksHeld; // 持有的表锁，bool=true为排他锁
+};
+
+
 // 投影项结构
 struct ProjectionItem {
     bool isAgg;
@@ -54,6 +77,7 @@ struct ProjectionItem {
     std::string funcName;
     bool star;
 };
+
 
 class DBMS {
 public:
@@ -77,5 +101,9 @@ private:
     void loadSnapshot();   // 从文件加载到 tables
     std::shared_mutex tablesMutex;      // 保护 tables 容器
     LockManager lockMgr;                // 表级锁管理器
+    // 线程局部事务指针
+    static thread_local std::unique_ptr<Transaction> currentTxn;
+    std::atomic<int> nextTxnId{1};
+    void lockTableInTxn(const std::string& tableName, bool exclusive);
 };
 

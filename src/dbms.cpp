@@ -9,6 +9,8 @@
 
 DBMS dbms;
 
+thread_local std::unique_ptr<Transaction> DBMS::currentTxn = nullptr;
+
 struct AggResult {
     long long count = 0;
     double sum = 0;
@@ -24,16 +26,95 @@ DBMS::DBMS() {
     loadSnapshot();
 }
 
+void DBMS::lockTableInTxn(const std::string& tableName, bool exclusive) {
+    if (!currentTxn) return; // 不应调用
+
+    // 查找当前事务是否已持有该表的锁
+    auto it = std::find_if(currentTxn->locksHeld.begin(), currentTxn->locksHeld.end(),
+        [&](const auto& lock){ return lock.first == tableName; });
+
+    if (it == currentTxn->locksHeld.end()) {
+        // 未加锁，直接加
+        if (exclusive) {
+            lockMgr.lockExclusive(tableName);
+            currentTxn->locksHeld.emplace_back(tableName, true);
+        } else {
+            lockMgr.lockShared(tableName);
+            currentTxn->locksHeld.emplace_back(tableName, false);
+        }
+    } else {
+        // 已持有锁，检查类型是否满足需求
+        bool hasExclusive = it->second;
+        if (exclusive && !hasExclusive) {
+            // 需要升级：先释放共享锁，再加排他锁
+            lockMgr.unlockShared(tableName);
+            currentTxn->locksHeld.erase(it);
+            lockMgr.lockExclusive(tableName);
+            currentTxn->locksHeld.emplace_back(tableName, true);
+        }
+        // 如果已持有排他锁，或已持有共享锁且需求也是共享锁，则什么都不做
+    }
+}
+
 void DBMS::begin() {
-    
+    if (currentTxn) {
+        std::cerr << "ERROR: Already in a transaction." << std::endl;
+        return;
+    }
+    currentTxn = std::make_unique<Transaction>();
+    currentTxn->txnId = nextTxnId++;
+    currentTxn->status = TxnStatus::ACTIVE;
+    std::cout << "Transaction " << currentTxn->txnId << " started." << std::endl;
 }
 
 void DBMS::commit() {
-    
+    if (!currentTxn) {
+        std::cerr << "ERROR: No active transaction." << std::endl;
+        return;
+    }
+    // 释放所有锁
+    for (const auto& lock : currentTxn->locksHeld) {
+        if (lock.second) // 排他锁
+            lockMgr.unlockExclusive(lock.first);
+        else
+            lockMgr.unlockShared(lock.first);
+    }
+    currentTxn->status = TxnStatus::COMMITTED;
+    currentTxn.reset();
+    std::cout << "Transaction committed." << std::endl;
 }
 
 void DBMS::rollback() {
-    
+    if (!currentTxn) {
+        std::cerr << "ERROR: No active transaction." << std::endl;
+        return;
+    }
+    // 逆序应用UNDO日志
+    for (auto it = currentTxn->undoLog.rbegin(); it != currentTxn->undoLog.rend(); ++it) {
+        Table* table = getTable(it->tableName);
+        if (!table) continue;
+        switch (it->type) {
+            case LogType::INSERT:
+                table->removeRow(it->rowId);
+                break;
+            case LogType::DELETE:
+                table->insertWithId(it->rowId, it->oldRow);
+                break;
+            case LogType::UPDATE:
+                table->updateRow(it->rowId, it->oldRow);
+                break;
+        }
+    }
+    // 释放所有锁
+    for (const auto& lock : currentTxn->locksHeld) {
+        if (lock.second)
+            lockMgr.unlockExclusive(lock.first);
+        else
+            lockMgr.unlockShared(lock.first);
+    }
+    currentTxn->status = TxnStatus::ABORTED;
+    currentTxn.reset();
+    std::cout << "Transaction rolled back." << std::endl;
 }
 
 Table* DBMS::getTable(const std::string& name) {
@@ -75,63 +156,120 @@ void DBMS::dropTable(const std::string& name) {
 }
 
 void DBMS::insertInto(const std::string& tableName, const std::vector<Value>& values) {
-    // 先加表写锁
-    lockMgr.lockExclusive(tableName);
+    if (currentTxn) {
+        lockTableInTxn(tableName, true); // 需要排他锁
 
-    Table* table = getTable(tableName);
-    if (!table) {
-        lockMgr.unlockExclusive(tableName);
-        return;
-    }
+        Table* table = getTable(tableName);
+        if (!table) {
+            lockMgr.unlockExclusive(tableName);
+            currentTxn->locksHeld.pop_back();
+            return;
+        }
 
-    if (table->insert(values)) {
-        std::cout << "Inserted 1 row into '" << tableName << "'." << std::endl;
+        int newId = table->insertAndGetId(values);
+        if (newId >= 0) {
+            LogRecord rec{LogType::INSERT, tableName, newId, {}, values};
+            currentTxn->undoLog.push_back(rec);
+            std::cout << "Inserted (txn) 1 row into '" << tableName << "'." << std::endl;
+        } else {
+            std::cerr << "Insert failed." << std::endl;
+        }
     } else {
-        std::cerr << "Insert failed." << std::endl;
+        // 自动提交模式
+        lockMgr.lockExclusive(tableName);
+        Table* table = getTable(tableName);
+        if (table && table->insert(values)) {
+            std::cout << "Inserted 1 row into '" << tableName << "'." << std::endl;
+            saveSnapshot();
+        } else {
+            std::cerr << "Insert failed." << std::endl;
+        }
+        lockMgr.unlockExclusive(tableName);
     }
-
-    lockMgr.unlockExclusive(tableName);
-    saveSnapshot();  // 自动提交模式立即持久化
 }
-
 
 void DBMS::update(const std::string& tableName,
                   const std::vector<std::pair<std::string, Value>>& assignments,
                   const Condition* cond) {
-    lockMgr.lockExclusive(tableName);
+    if (currentTxn) {
+        lockTableInTxn(tableName, true);
 
-    Table* table = getTable(tableName);
-    if (!table) {
-        lockMgr.unlockExclusive(tableName);
-        return;
-    }
+        Table* table = getTable(tableName);
+        if (!table) {
+            lockMgr.unlockExclusive(tableName);
+            currentTxn->locksHeld.pop_back();
+            return;
+        }
 
-    if (table->update(cond, assignments)) {
-        std::cout << "Updated row(s)." << std::endl;
+        auto rows = table->selectWithIds(cond);
+        if (rows.empty()) {
+            std::cout << "No rows matched." << std::endl;
+            return;
+        }
+
+        for (const auto& [id, oldRow] : rows) {
+            std::vector<Value> newRow = oldRow;
+            for (const auto& [colName, newVal] : assignments) {
+                auto it = table->getColumnIndex().find(colName);
+                if (it == table->getColumnIndex().end()) {
+                    std::cerr << "ERROR: Unknown column '" << colName << "'." << std::endl;
+                    return;
+                }
+                newRow[it->second] = newVal;
+            }
+
+            LogRecord rec{LogType::UPDATE, tableName, id, oldRow, newRow};
+            currentTxn->undoLog.push_back(rec);
+            table->updateRow(id, newRow);
+        }
+        std::cout << "Updated (txn) " << rows.size() << " row(s)." << std::endl;
     } else {
-        std::cerr << "Update failed." << std::endl;
+        lockMgr.lockExclusive(tableName);
+        Table* table = getTable(tableName);
+        if (table && table->update(cond, assignments)) {
+            std::cout << "Updated row(s)." << std::endl;
+            saveSnapshot();
+        } else {
+            std::cerr << "Update failed." << std::endl;
+        }
+        lockMgr.unlockExclusive(tableName);
     }
-    lockMgr.unlockExclusive(tableName);
-    saveSnapshot();
 }
 
 void DBMS::deleteFrom(const std::string& tableName, const Condition* cond) {
-    lockMgr.lockExclusive(tableName);
+    if (currentTxn) {
+        lockTableInTxn(tableName, true);
 
-    Table* table = getTable(tableName);
-    if (!table) {
-        lockMgr.unlockExclusive(tableName);
-        return;
-    }
+        Table* table = getTable(tableName);
+        if (!table) {
+            lockMgr.unlockExclusive(tableName);
+            currentTxn->locksHeld.pop_back();
+            return;
+        }
 
-    if (table->remove(cond)) {
-        std::cout << "Deleted row(s)." << std::endl;
+        auto rows = table->selectWithIds(cond);
+        if (rows.empty()) {
+            std::cout << "No rows matched." << std::endl;
+            return;
+        }
+
+        for (const auto& [id, oldRow] : rows) {
+            LogRecord rec{LogType::DELETE, tableName, id, oldRow, {}};
+            currentTxn->undoLog.push_back(rec);
+            table->removeRow(id);
+        }
+        std::cout << "Deleted (txn) " << rows.size() << " row(s)." << std::endl;
     } else {
-        std::cerr << "Delete failed." << std::endl;
+        lockMgr.lockExclusive(tableName);
+        Table* table = getTable(tableName);
+        if (table && table->remove(cond)) {
+            std::cout << "Deleted row(s)." << std::endl;
+            saveSnapshot();
+        } else {
+            std::cerr << "Delete failed." << std::endl;
+        }
+        lockMgr.unlockExclusive(tableName);
     }
-
-    lockMgr.unlockExclusive(tableName);
-    saveSnapshot();
 }
 
 // 将 Value 转换为字符串（用于保存）
@@ -245,12 +383,16 @@ void DBMS::selectFrom(const std::string& tableName,
                       const Condition* cond,
                       const std::vector<std::pair<std::string, bool>>* orderBy)
 {
-    // 加表读锁（共享锁）
-    lockMgr.lockShared(tableName);
+    bool inTxn = (currentTxn != nullptr);
+    if (inTxn) {
+        lockTableInTxn(tableName, true);
+    } else {
+        lockMgr.lockShared(tableName);
+    }
 
     Table* table = getTable(tableName);
     if (!table) {
-        lockMgr.unlockShared(tableName);
+        if (!inTxn) lockMgr.unlockShared(tableName);
         return;
     }
 
@@ -441,5 +583,8 @@ void DBMS::selectFrom(const std::string& tableName,
     }
     std::cout << resultRows.size() << " row(s) returned." << std::endl;
 
-    lockMgr.unlockShared(tableName);
+    if (!inTxn) {
+        lockMgr.unlockShared(tableName);
+    }
+    // 事务中锁会在 commit/rollback 时释放
 }
